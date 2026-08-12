@@ -8,6 +8,7 @@ async function PushFile() {
     let s3Client;
     let bucketName;
 
+    // Load AWS configuration
     try {
         const config = await import("../config/aws-config.js");
 
@@ -19,6 +20,7 @@ async function PushFile() {
         return;
     }
 
+    // Validate S3 client
     if (!s3Client) {
         console.error(
             "AWS S3 Client could not be initialized. Check config/aws-config.js."
@@ -26,6 +28,7 @@ async function PushFile() {
         return;
     }
 
+    // Validate bucket name
     if (!bucketName) {
         console.error(
             "S3 bucket name is missing in config/aws-config.js."
@@ -33,7 +36,11 @@ async function PushFile() {
         return;
     }
 
+    // Local repository path
     const repoPath = path.resolve(process.cwd(), ".apnaGit");
+
+    // Commits directory
+    const commitsPath = path.join(repoPath, "commits");
 
     // Check whether repository exists
     try {
@@ -45,52 +52,115 @@ async function PushFile() {
         return;
     }
 
-    // Read head.json
-    const headPath = path.join(repoPath, "head.json");
-
-    let headContent;
-
+    // Check whether commits directory exists
     try {
-        headContent = await fs.readFile(headPath, "utf-8");
+        await fs.access(commitsPath);
     } catch {
         console.error(
-            "head.json not found inside .apnaGit."
+            "Commits directory not found inside .apnaGit."
         );
         return;
     }
 
     try {
         console.log(
-            `Uploading repository metadata to S3 bucket "${bucketName}"...`
+            `\nUploading repository commits to S3 bucket "${bucketName}"...`
         );
 
-        const command = new PutObjectCommand({
-            Bucket: bucketName,
-            Key: "repo-state/head.json",
-            Body: headContent,
-            ContentType: "application/json",
+        // Get all commit directories
+        const commitDirs = await fs.readdir(commitsPath, {
+            withFileTypes: true,
         });
 
-        await s3Client.send(command);
-
-        console.log("Repository state successfully pushed to S3!");
-        console.log(
-            `Uploaded: s3://${bucketName}/repo-state/head.json`
+        // Only process directories
+        const directories = commitDirs.filter((entry) =>
+            entry.isDirectory()
         );
+
+        if (directories.length === 0) {
+            console.log("No commits found to push.");
+            return;
+        }
+
+        let uploadedFiles = 0;
+
+        // Loop through every commit directory
+        for (const commitDir of directories) {
+            const commitName = commitDir.name;
+            const commitPath = path.join(commitsPath, commitName);
+
+            console.log(`\nProcessing commit: ${commitName}`);
+
+            // Get files inside the commit directory
+            const files = await fs.readdir(commitPath, {
+                withFileTypes: true,
+            });
+
+            // Upload every file
+            for (const file of files) {
+                // Ignore nested directories
+                if (!file.isFile()) {
+                    continue;
+                }
+
+                const fileName = file.name;
+                const filePath = path.join(commitPath, fileName);
+
+                // Read file content
+                const fileContent = await fs.readFile(filePath);
+
+                // S3 key:
+                // commits/<commitDir>/<fileName>
+                const s3Key = `commits/${commitName}/${fileName}`;
+
+                console.log(`Uploading: ${s3Key}`);
+
+                const command = new PutObjectCommand({
+                    Bucket: bucketName,
+                    Key: s3Key,
+                    Body: fileContent,
+                });
+
+                await s3Client.send(command);
+
+                uploadedFiles++;
+
+                console.log(`Uploaded successfully: ${s3Key}`);
+            }
+        }
+
+        console.log("\n----------------------------------------");
+        console.log("Repository successfully pushed to S3!");
+        console.log(`Total files uploaded: ${uploadedFiles}`);
+        console.log(`S3 Bucket: ${bucketName}`);
+        console.log("----------------------------------------");
+
     } catch (error) {
-        console.error("\nFailed to push to S3.");
+        console.error("\nFailed to push repository to S3.");
         console.error("Error:", error.message);
 
-        if (error.name === "CredentialsProviderError") {
+        // AWS credentials error
+        if (
+            error.name === "CredentialsProviderError" ||
+            error.name === "CredentialProviderError"
+        ) {
             console.error(
                 "\nAWS credentials were not found. Configure them using:"
             );
             console.error("aws configure");
         }
 
+        // Bucket doesn't exist
         if (error.name === "NoSuchBucket") {
             console.error(
                 `\nThe S3 bucket "${bucketName}" does not exist.`
+            );
+        }
+
+        // Access denied
+        if (error.name === "AccessDenied") {
+            console.error(
+                "\nAccess denied. Check your AWS IAM permissions."
             );
         }
     }
