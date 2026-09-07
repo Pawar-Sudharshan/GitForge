@@ -7,6 +7,10 @@ import CommitFile from "./controllers/commit.js";
 import PushFile from "./controllers/push.js";
 import PullFile from "./controllers/pull.js";
 import RevertFile from "./controllers/revert.js";
+import mainRouter from './routes/main.router.js';
+import userRouter from './routes/user.router.js';
+import issueRouter from './routes/issue.router.js';
+import repoRouter from './routes/repo.router.js';
 
 import express from "express";
 import dotenv from "dotenv";
@@ -63,6 +67,8 @@ async function startServer() {
         credentials: true
       })
     );
+
+    app.use('/', mainRouter);
 
     app.use(express.json());
     app.use(express.urlencoded({ extended: true }));
