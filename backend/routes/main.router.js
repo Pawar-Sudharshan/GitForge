@@ -9,7 +9,7 @@ mainRouter.get("/", (req, res) => {
     res.send("Welcome!");
 });
 
-mainRouter.use("/users", userRouter);
+mainRouter.use("/", userRouter);
 mainRouter.use("/repositories", repoRouter);
 mainRouter.use("/issues", issueRouter);
 

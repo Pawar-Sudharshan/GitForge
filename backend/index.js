@@ -108,8 +108,20 @@ async function startServer() {
 
     const PORT = Number(process.env.PORT) || 5000;
 
+    httpServer.on("error", (err) => {
+      if (err.code === "EADDRINUSE") {
+        console.error(`\n❌ Port ${PORT} is already in use.`);
+        console.error(`   Stop the existing process and try again:\n`);
+        console.error(`   Windows: Stop-Process -Id (Get-NetTCPConnection -LocalPort ${PORT} -State Listen | Select-Object -ExpandProperty OwningProcess) -Force`);
+        console.error(`   Mac/Linux: kill -9 $(lsof -ti:${PORT})\n`);
+      } else {
+        console.error("❌ Server error:", err.message);
+      }
+      process.exitCode = 1;
+    });
+
     httpServer.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
+      console.log(`✅ Server is running on port ${PORT}`);
     });
   } catch (error) {
     console.error("Server startup failed:", error.message);
