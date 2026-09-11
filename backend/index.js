@@ -8,9 +8,6 @@ import PushFile from "./controllers/push.js";
 import PullFile from "./controllers/pull.js";
 import RevertFile from "./controllers/revert.js";
 import mainRouter from './routes/main.router.js';
-import userRouter from './routes/user.router.js';
-import issueRouter from './routes/issue.router.js';
-import repoRouter from './routes/repo.router.js';
 
 import express from "express";
 import dotenv from "dotenv";
@@ -60,28 +57,19 @@ async function startServer() {
     const allowedOrigin =
       process.env.CLIENT_URL || "http://localhost:3000";
 
-    // Middleware
+    // Middleware — order matters: parsers before routers
     app.use(
       cors({
         origin: allowedOrigin,
         credentials: true
       })
     );
-
-    app.use('/', mainRouter);
-
     app.use(express.json());
     app.use(express.urlencoded({ extended: true }));
     app.use(cookieParser());
 
-    // Basic route
-    app.get("/", (req, res) => {
-      res.send("Server started");
-    });
-
     // API routes
-    const router = express.Router();
-    app.use("/api", router);
+    app.use('/', mainRouter);
 
     // Create HTTP server
     const httpServer = createServer(app);
