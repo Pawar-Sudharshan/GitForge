@@ -38,7 +38,7 @@ const cli = yargs(hideBin(process.argv))
   .command("pull", "Retrieve remote repo details", {}, (argv) => {
     PullFile(argv);
   })
-  .command("revert", "Revert to a previous commit", {}, (argv) => {
+  .command("revert <commitId>", "Revert to a previous commit", {}, (argv) => {
     RevertFile(argv);
   })
   .demandCommand(1)
