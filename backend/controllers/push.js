@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { sanitizeRepoId, validatePathSafety } from "../utils/pathSecurity.js";
+import { sanitizeRepoId, isExcluded } from "../utils/pathSecurity.js";
 import { buildDirectoryManifest } from "../utils/snapshotEngine.js";
 
 async function PushFile(argv = {}) {
@@ -13,22 +13,24 @@ async function PushFile(argv = {}) {
     // Load AWS configuration
     try {
         const config = await import("../config/aws-config.js");
-        s3Client = config.s3Client;
-        bucketName = config.S3_BUCKET;
+        s3Client = config.getS3Client ? config.getS3Client() : config.s3Client;
+        bucketName = config.getBucketName ? config.getBucketName() : config.S3_BUCKET;
     } catch (error) {
         console.error("\n[Error] Could not load AWS configuration.");
         console.error(error.message);
-        return;
+        return { success: false, error: error.message };
     }
 
     if (!s3Client) {
-        console.error("AWS S3 Client could not be initialized. Check config/aws-config.js.");
-        return;
+        const msg = "AWS S3 Client could not be initialized. Check config/aws-config.js.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     if (!bucketName) {
-        console.error("S3 bucket name is missing. Please set S3_BUCKET_NAME in your environment.");
-        return;
+        const msg = "S3 bucket name is missing. Please set S3_BUCKET_NAME in your environment.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     const repoPath = path.resolve(process.cwd(), ".apnaGit");
@@ -40,8 +42,9 @@ async function PushFile(argv = {}) {
         await fs.access(repoPath);
         await fs.access(commitsPath);
     } catch {
-        console.error('Repository not initialized. Run "node index.js init" first.');
-        return;
+        const msg = 'Repository not initialized. Run "node index.js init" first.';
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     // Resolve repository ID safely
@@ -50,19 +53,28 @@ async function PushFile(argv = {}) {
         const configRaw = await fs.readFile(configPath, "utf-8");
         repositoryId = JSON.parse(configRaw).repositoryId;
     } catch {
-        repositoryId = argv.repoId || process.env.APNAGIT_REPO_ID;
+        repositoryId = argv.repoId || (argv._ && argv._[1]) || process.env.APNAGIT_REPO_ID;
+        if (repositoryId) {
+            // Self-heal config.json
+            try {
+                const sanitized = sanitizeRepoId(repositoryId);
+                await fs.writeFile(configPath, JSON.stringify({ repositoryId: sanitized, version: 2 }, null, 2));
+                console.log(`[Config] Automatically saved repository ID "${sanitized}" to .apnaGit/config.json`);
+            } catch {}
+        }
     }
 
     if (!repositoryId) {
-        console.error("Repository ID is not configured. Run 'node index.js init <repoId>' or specify in config.json.");
-        return;
+        const msg = "Repository ID is not configured. Run 'node index.js init <repoId>' or specify in config.json.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     try {
         repositoryId = sanitizeRepoId(repositoryId);
     } catch (err) {
         console.error(`Error: ${err.message}`);
-        return;
+        return { success: false, error: err.message };
     }
 
     // Read local HEAD
@@ -74,9 +86,10 @@ async function PushFile(argv = {}) {
 
     if (!localHeadCommit) {
         console.log("No commits found in local repository to push.");
-        return;
+        return { success: true, message: "No commits found in local repository to push." };
     }
 
+    const force = Boolean(argv.force || argv.f);
     const s3Prefix = `repositories/${repositoryId}`;
     const headKey = `${s3Prefix}/repo-state/head.json`;
 
@@ -95,7 +108,6 @@ async function PushFile(argv = {}) {
             remoteHeadEtag = headRes.ETag;
         } catch (err) {
             if (err.name !== "NoSuchKey" && err.$metadata?.httpStatusCode !== 404) {
-                // If S3 returns another error (like permissions), let catch block handle it
                 throw err;
             }
         }
@@ -104,7 +116,7 @@ async function PushFile(argv = {}) {
         if (remoteHeadData && remoteHeadData.currentCommit) {
             if (remoteHeadData.currentCommit === localHeadCommit) {
                 console.log("Everything up-to-date.");
-                return;
+                return { success: true, message: "Everything up-to-date.", upToDate: true };
             }
 
             // Check if remote HEAD is an ancestor of local HEAD
@@ -125,11 +137,15 @@ async function PushFile(argv = {}) {
                 }
             }
 
-            if (!isFastForward) {
+            if (!isFastForward && !force) {
                 console.error(`\n[Push Conflict] Remote HEAD (${remoteHeadData.currentCommit}) differs from local history.`);
                 console.error("Updates were rejected because the remote contains work that you do not have locally.");
-                console.error("Please run 'pull' first before pushing.");
-                return;
+                console.error("Please run 'pull' first before pushing, or use --force if you intentionally want to overwrite.");
+                return { success: false, conflict: true, remoteHead: remoteHeadData.currentCommit };
+            }
+
+            if (!isFastForward && force) {
+                console.warn(`\n[Notice] Forcing push despite divergent remote HEAD (${remoteHeadData.currentCommit}).`);
             }
         }
 
@@ -160,6 +176,12 @@ async function PushFile(argv = {}) {
             // Use buildDirectoryManifest to upload all files recursively
             const manifest = await buildDirectoryManifest(commitDirPath);
             for (const item of manifest) {
+                // Defense-in-depth: Never upload excluded secrets (e.g., .env)
+                if (isExcluded(item.path)) {
+                    console.warn(`[Security] Skipping excluded secret or system file from upload: ${item.path}`);
+                    continue;
+                }
+
                 const itemLocalPath = path.join(commitDirPath, item.path);
                 const s3Key = `${s3Prefix}/commits/${commitName}/${item.path.replace(/\\/g, '/')}`;
 
@@ -208,7 +230,7 @@ async function PushFile(argv = {}) {
                 console.error("\n[Push Concurrency Conflict] Remote HEAD was modified by another push while your upload was in progress.");
                 console.error("Your commit objects were uploaded, but remote HEAD was not updated to prevent overwriting newer state.");
                 console.error("Please pull and merge before pushing again.");
-                return;
+                return { success: false, concurrencyConflict: true, error: "PreconditionFailed" };
             }
             throw headPutErr;
         }
@@ -220,9 +242,17 @@ async function PushFile(argv = {}) {
         console.log(`Total objects uploaded: ${uploadedFiles + 1}`);
         console.log(`S3 Bucket: ${bucketName}`);
         console.log("----------------------------------------");
+
+        return {
+            success: true,
+            repositoryId,
+            currentCommit: localHeadCommit,
+            uploadedObjects: uploadedFiles + 1
+        };
     } catch (error) {
         console.error("\nFailed to push repository to S3.");
         console.error("Error:", error.message);
+        return { success: false, error: error.message };
     }
 }
 

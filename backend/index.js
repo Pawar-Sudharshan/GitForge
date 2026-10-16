@@ -33,11 +33,19 @@ const cli = yargs(hideBin(process.argv))
   .command("commit <message>", "Save staged changes to history", {}, (argv) => {
     CommitFile(argv);
   })
-  .command("push", "Upload local commits to remote repo", {}, (argv) => {
-    PushFile(argv);
+  .command("push [repoId]", "Upload local commits to remote repo", (y) => {
+    return y
+      .positional("repoId", { type: "string", describe: "Remote repository ID on S3" })
+      .option("force", { type: "boolean", describe: "Force push ignoring fast-forward checks" });
+  }, async (argv) => {
+    await PushFile(argv);
   })
-  .command("pull", "Retrieve remote repo details", {}, (argv) => {
-    PullFile(argv);
+  .command("pull [repoId]", "Retrieve remote repo details", (y) => {
+    return y
+      .positional("repoId", { type: "string", describe: "Remote repository ID on S3" })
+      .option("checkout", { type: "boolean", describe: "Update working tree to pulled HEAD" });
+  }, async (argv) => {
+    await PullFile(argv);
   })
   .command("revert <commitId>", "Revert to a previous commit", {}, (argv) => {
     RevertFile(argv);

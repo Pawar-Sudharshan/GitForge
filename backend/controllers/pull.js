@@ -1,7 +1,8 @@
 import fs from "fs/promises";
 import path from "path";
 import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
-import { sanitizeRepoId } from "../utils/pathSecurity.js";
+import { sanitizeRepoId, validatePathSafety } from "../utils/pathSecurity.js";
+import { copyDirectoryRecursive } from "../utils/snapshotEngine.js";
 
 async function PullFile(argv = {}) {
     console.log("Fetching remote repository history...");
@@ -12,34 +13,38 @@ async function PullFile(argv = {}) {
     // Load AWS configuration
     try {
         const config = await import("../config/aws-config.js");
-        s3Client = config.s3Client;
-        bucketName = config.S3_BUCKET;
+        s3Client = config.getS3Client ? config.getS3Client() : config.s3Client;
+        bucketName = config.getBucketName ? config.getBucketName() : config.S3_BUCKET;
     } catch (error) {
         console.error("\n[Error] Could not load AWS configuration.");
         console.error(error.message);
-        return;
+        return { success: false, error: error.message };
     }
 
     if (!s3Client) {
-        console.error("AWS S3 Client could not be initialized. Check config/aws-config.js.");
-        return;
+        const msg = "AWS S3 Client could not be initialized. Check config/aws-config.js.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     if (!bucketName) {
-        console.error("S3 bucket name is missing. Please set S3_BUCKET_NAME in your environment.");
-        return;
+        const msg = "S3 bucket name is missing. Please set S3_BUCKET_NAME in your environment.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     const repoPath = path.resolve(process.cwd(), ".apnaGit");
     const commitsPath = path.join(repoPath, "commits");
     const headPath = path.join(repoPath, "head.json");
     const configPath = path.join(repoPath, "config.json");
+    const tmpPullPath = path.join(repoPath, `tmp-pull-${Date.now()}`);
 
     try {
         await fs.access(repoPath);
     } catch {
-        console.error('Repository not initialized. Run "node index.js init" first.');
-        return;
+        const msg = 'Repository not initialized. Run "node index.js init" first.';
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     // Resolve repository ID safely
@@ -48,22 +53,29 @@ async function PullFile(argv = {}) {
         const configRaw = await fs.readFile(configPath, "utf-8");
         repositoryId = JSON.parse(configRaw).repositoryId;
     } catch {
-        repositoryId = argv.repoId || process.env.APNAGIT_REPO_ID;
+        repositoryId = argv.repoId || (argv._ && argv._[1]) || process.env.APNAGIT_REPO_ID;
+        if (repositoryId) {
+            try {
+                const sanitized = sanitizeRepoId(repositoryId);
+                await fs.writeFile(configPath, JSON.stringify({ repositoryId: sanitized, version: 2 }, null, 2));
+                console.log(`[Config] Automatically saved repository ID "${sanitized}" to .apnaGit/config.json`);
+            } catch {}
+        }
     }
 
     if (!repositoryId) {
-        console.error("Repository ID is not configured. Run 'node index.js init <repoId>' or specify '--repo <repoId>'.");
-        return;
+        const msg = "Repository ID is not configured. Run 'node index.js init <repoId>' or specify '--repoId <id>'.";
+        console.error(msg);
+        return { success: false, error: msg };
     }
 
     try {
         repositoryId = sanitizeRepoId(repositoryId);
     } catch (err) {
         console.error(`Error: ${err.message}`);
-        return;
+        return { success: false, error: err.message };
     }
 
-    const s3Prefix = `repositories/${repositoryId}/`;
     const commitsPrefix = `repositories/${repositoryId}/commits/`;
     const headKey = `repositories/${repositoryId}/repo-state/head.json`;
 
@@ -94,18 +106,36 @@ async function PullFile(argv = {}) {
 
         if (allObjects.length === 0) {
             console.log("No commits found in the remote repository.");
-        } else {
-            let downloadedFiles = 0;
+            return { success: true, message: "No commits found in the remote repository.", downloadedFiles: 0 };
+        }
 
+        // Transactional Staging for Failure Recovery: download into tmpPullPath first
+        await fs.mkdir(tmpPullPath, { recursive: true });
+        let downloadedFiles = 0;
+        const commitFolders = new Set();
+
+        try {
             for (const object of allObjects) {
                 const s3Key = object.Key;
                 if (!s3Key || s3Key.endsWith("/")) continue;
 
-                // Strip prefix
                 const relativeToCommits = s3Key.slice(commitsPrefix.length);
-                const localFilePath = path.join(commitsPath, relativeToCommits);
 
-                await fs.mkdir(path.dirname(localFilePath), { recursive: true });
+                // Security: Validate path safety against directory traversal attempts
+                let safeRel;
+                try {
+                    safeRel = validatePathSafety(relativeToCommits, commitsPath);
+                } catch (secErr) {
+                    throw new Error(`Security Violation: Remote S3 object key "${s3Key}" failed path safety check: ${secErr.message}`);
+                }
+
+                const commitId = safeRel.split("/")[0];
+                if (commitId) {
+                    commitFolders.add(commitId);
+                }
+
+                const stagedFilePath = path.join(tmpPullPath, safeRel);
+                await fs.mkdir(path.dirname(stagedFilePath), { recursive: true });
 
                 const getCommand = new GetObjectCommand({
                     Bucket: bucketName,
@@ -118,21 +148,61 @@ async function PullFile(argv = {}) {
                 const symlinkTarget = fileResponse.Metadata?.["x-target"];
 
                 if (isSymlink && symlinkTarget) {
-                    try { await fs.unlink(localFilePath); } catch {}
-                    await fs.symlink(symlinkTarget, localFilePath);
+                    // Security: Verify symlink target does not escape repository boundary
+                    const sanitizedTarget = symlinkTarget.replace(/\\/g, "/");
+                    if (sanitizedTarget.startsWith("/") || /^[a-zA-Z]:/.test(sanitizedTarget) || sanitizedTarget.split("/").includes("..")) {
+                        console.warn(`[Security Warning] Skipping unsafe remote symlink target "${symlinkTarget}".`);
+                        await fs.writeFile(stagedFilePath, `[unsafe-symlink:${symlinkTarget}]`);
+                    } else {
+                        try {
+                            try { await fs.unlink(stagedFilePath); } catch {}
+                            await fs.symlink(sanitizedTarget, stagedFilePath);
+                        } catch (symlinkErr) {
+                            // On Windows without elevated/developer permissions, write a link pointer
+                            await fs.writeFile(stagedFilePath, `symlink:${sanitizedTarget}`);
+                        }
+                    }
                 } else {
                     const fileContent = await fileResponse.Body.transformToByteArray();
-                    await fs.writeFile(localFilePath, Buffer.from(fileContent));
+                    await fs.writeFile(stagedFilePath, Buffer.from(fileContent));
                 }
 
                 downloadedFiles++;
-                console.log(`Downloaded: ${relativeToCommits}`);
             }
 
-            console.log(`\nTotal commit objects downloaded: ${downloadedFiles}`);
+            // Step 2: Integrity Verification across all staged commit snapshots
+            for (const cId of commitFolders) {
+                const cStagedDir = path.join(tmpPullPath, cId);
+                const metaFile = path.join(cStagedDir, "commit-metadata.json");
+                try {
+                    const metaRaw = await fs.readFile(metaFile, "utf-8");
+                    const meta = JSON.parse(metaRaw);
+                    if (!meta.id) {
+                        throw new Error(`Missing commit id in metadata for "${cId}".`);
+                    }
+                } catch (metaErr) {
+                    console.warn(`[Integrity Warning] Commit "${cId}" metadata verification issue: ${metaErr.message}`);
+                }
+            }
+
+            // Move verified commits into local commitsPath
+            for (const cId of commitFolders) {
+                const srcDir = path.join(tmpPullPath, cId);
+                const destDir = path.join(commitsPath, cId);
+                await fs.mkdir(destDir, { recursive: true });
+                await copyDirectoryRecursive(srcDir, destDir, false);
+            }
+
+            console.log(`\nTotal commit objects downloaded and verified: ${downloadedFiles}`);
+        } finally {
+            // Clean up temporary download staging
+            try {
+                await fs.rm(tmpPullPath, { recursive: true, force: true });
+            } catch {}
         }
 
-        // Step 2: Download remote HEAD
+        // Step 3: Download remote HEAD safely
+        let remoteHeadCommitId = null;
         try {
             console.log("Downloading repository metadata...");
             const headCommand = new GetObjectCommand({
@@ -143,16 +213,17 @@ async function PullFile(argv = {}) {
             const headResponse = await s3Client.send(headCommand);
             const headContent = await headResponse.Body.transformToString();
             const parsedRemoteHead = JSON.parse(headContent);
+            remoteHeadCommitId = parsedRemoteHead.currentCommit;
 
-            if (parsedRemoteHead.currentCommit) {
+            if (remoteHeadCommitId) {
                 // Validate that the referenced commit exists locally
-                const commitDir = path.join(commitsPath, parsedRemoteHead.currentCommit);
+                const commitDir = path.join(commitsPath, remoteHeadCommitId);
                 try {
                     await fs.access(commitDir);
-                    await fs.writeFile(headPath, JSON.stringify({ currentCommit: parsedRemoteHead.currentCommit }, null, 2));
-                    console.log(`head.json updated to remote commit: ${parsedRemoteHead.currentCommit}`);
+                    await fs.writeFile(headPath, JSON.stringify({ currentCommit: remoteHeadCommitId }, null, 2));
+                    console.log(`head.json updated to remote commit: ${remoteHeadCommitId}`);
                 } catch {
-                    console.warn(`Warning: Remote HEAD points to "${parsedRemoteHead.currentCommit}", but commit folder was not found locally. Local HEAD was not updated.`);
+                    console.warn(`Warning: Remote HEAD points to "${remoteHeadCommitId}", but commit folder was not found locally. Local HEAD was not updated.`);
                 }
             }
         } catch (error) {
@@ -163,14 +234,35 @@ async function PullFile(argv = {}) {
             }
         }
 
+        // Step 4: Optional automatic working directory checkout if requested
+        if (argv.checkout && remoteHeadCommitId) {
+            try {
+                const revertModule = await import("./revert.js");
+                const RevertFile = revertModule.default || revertModule;
+                console.log(`\nSynchronizing working tree with pulled commit ${remoteHeadCommitId}...`);
+                await RevertFile({ commitId: remoteHeadCommitId });
+            } catch (revErr) {
+                console.warn(`[Checkout Warning] Could not automatically update working tree: ${revErr.message}`);
+            }
+        }
+
         console.log("\n----------------------------------------");
         console.log("Repository successfully pulled from S3!");
         console.log(`Repository ID: ${repositoryId}`);
+        console.log(`Remote HEAD: ${remoteHeadCommitId || "None"}`);
         console.log(`S3 Bucket: ${bucketName}`);
         console.log("----------------------------------------");
+
+        return {
+            success: true,
+            repositoryId,
+            remoteHead: remoteHeadCommitId,
+            downloadedFiles
+        };
     } catch (error) {
         console.error("\nFailed to pull repository from S3.");
         console.error("Error:", error.message);
+        return { success: false, error: error.message };
     }
 }
 
