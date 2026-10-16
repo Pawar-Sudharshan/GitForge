@@ -7,6 +7,7 @@ import CommitFile from "./controllers/commit.js";
 import PushFile from "./controllers/push.js";
 import PullFile from "./controllers/pull.js";
 import RevertFile from "./controllers/revert.js";
+import RemoveFile from "./controllers/rm.js";
 import mainRouter from './routes/main.router.js';
 
 import express from "express";
@@ -40,6 +41,9 @@ const cli = yargs(hideBin(process.argv))
   })
   .command("revert <commitId>", "Revert to a previous commit", {}, (argv) => {
     RevertFile(argv);
+  })
+  .command("rm <file>", "Remove a file and stage deletion", {}, (argv) => {
+    RemoveFile(argv);
   })
   .demandCommand(1)
   .help();

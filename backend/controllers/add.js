@@ -1,6 +1,8 @@
 import fs from 'fs/promises';
 import path from 'path';
 
+import { validatePathSafety, isExcluded, inspectSymlinkSafety } from '../utils/pathSecurity.js';
+
 async function AddFile(argv) {
     const file = argv.file || (argv._ && argv._[1]);
     if (!file) {
@@ -10,6 +12,7 @@ async function AddFile(argv) {
 
     const repoPath = path.resolve(process.cwd(), '.apnaGit');
     const stagingPath = path.join(repoPath, 'staging');
+    const workspaceRoot = process.cwd();
 
     try {
         await fs.access(repoPath);
@@ -18,20 +21,45 @@ async function AddFile(argv) {
         return;
     }
 
-    const sourcePath = path.resolve(process.cwd(), file);
+    let relPath;
     try {
-        const stats = await fs.stat(sourcePath);
+        relPath = validatePathSafety(file, workspaceRoot);
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        return;
+    }
+
+    // Check exclusion policy
+    if (isExcluded(relPath)) {
+        console.error(`[Excluded] "${relPath}" matches an excluded secret or system pattern and cannot be added.`);
+        return;
+    }
+
+    const sourcePath = path.resolve(workspaceRoot, relPath);
+
+    try {
+        // Check for symlinks and symlink safety
+        const symlinkInfo = await inspectSymlinkSafety(sourcePath, workspaceRoot);
+
+        const stats = await fs.lstat(sourcePath);
         if (stats.isDirectory()) {
             console.error('Adding directories is not supported yet. Please add specific files.');
             return;
         }
 
-        // Copy file to staging
-        const fileName = path.basename(sourcePath);
-        const destPath = path.join(stagingPath, fileName);
-        await fs.copyFile(sourcePath, destPath);
+        const destPath = path.join(stagingPath, relPath);
+        await fs.mkdir(path.dirname(destPath), { recursive: true });
 
-        // Update index.json list
+        if (symlinkInfo.isSymlink) {
+            // Remove existing staging item if present
+            try { await fs.unlink(destPath); } catch {}
+            // Create symlink in staging pointing to same relative target
+            await fs.symlink(symlinkInfo.target, destPath);
+        } else {
+            await fs.copyFile(sourcePath, destPath);
+        }
+
+        // Update index.json (structured format supporting paths)
         const indexPath = path.join(repoPath, 'index.json');
         let indexList = [];
         try {
@@ -39,12 +67,22 @@ async function AddFile(argv) {
             indexList = JSON.parse(indexData);
         } catch {}
 
-        if (!indexList.includes(fileName)) {
-            indexList.push(fileName);
-            await fs.writeFile(indexPath, JSON.stringify(indexList));
-        }
+        // Remove any prior entry for this path
+        indexList = indexList.filter(item => {
+            if (typeof item === 'string') return item !== relPath;
+            return item.path !== relPath;
+        });
 
-        console.log(`File "${fileName}" staged successfully.`);
+        // Store structured object with toString fallback or plain entry with metadata
+        indexList.push({
+            path: relPath,
+            action: 'add',
+            isSymlink: symlinkInfo.isSymlink,
+            symlinkTarget: symlinkInfo.target || null
+        });
+
+        await fs.writeFile(indexPath, JSON.stringify(indexList, null, 2));
+        console.log(`File "${relPath}" staged successfully.`);
     } catch (err) {
         console.error(`Error staging file "${file}":`, err.message);
     }

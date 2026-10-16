@@ -1,8 +1,9 @@
 import fs from "fs/promises";
 import path from "path";
 import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { sanitizeRepoId } from "../utils/pathSecurity.js";
 
-async function PullFile() {
+async function PullFile(argv = {}) {
     console.log("Fetching remote repository history...");
 
     let s3Client;
@@ -11,7 +12,6 @@ async function PullFile() {
     // Load AWS configuration
     try {
         const config = await import("../config/aws-config.js");
-
         s3Client = config.s3Client;
         bucketName = config.S3_BUCKET;
     } catch (error) {
@@ -20,137 +20,144 @@ async function PullFile() {
         return;
     }
 
-    // Validate S3 client
     if (!s3Client) {
-        console.error(
-            "AWS S3 Client could not be initialized. Check config/aws-config.js."
-        );
+        console.error("AWS S3 Client could not be initialized. Check config/aws-config.js.");
         return;
     }
 
-    // Validate bucket name
     if (!bucketName) {
-        console.error(
-            "S3 bucket name is missing in config/aws-config.js."
-        );
+        console.error("S3 bucket name is missing. Please set S3_BUCKET_NAME in your environment.");
         return;
     }
 
-    // Local repository path
     const repoPath = path.resolve(process.cwd(), ".apnaGit");
-
-    // Commits directory
     const commitsPath = path.join(repoPath, "commits");
+    const headPath = path.join(repoPath, "head.json");
+    const configPath = path.join(repoPath, "config.json");
 
-    // Check whether repository exists
     try {
         await fs.access(repoPath);
     } catch {
-        console.error(
-            'Repository not initialized. Run "node index.js init" first.'
-        );
+        console.error('Repository not initialized. Run "node index.js init" first.');
+        return;
+    }
+
+    // Resolve repository ID safely
+    let repositoryId;
+    try {
+        const configRaw = await fs.readFile(configPath, "utf-8");
+        repositoryId = JSON.parse(configRaw).repositoryId;
+    } catch {
+        repositoryId = argv.repoId || process.env.APNAGIT_REPO_ID;
+    }
+
+    if (!repositoryId) {
+        console.error("Repository ID is not configured. Run 'node index.js init <repoId>' or specify '--repo <repoId>'.");
         return;
     }
 
     try {
-        console.log(
-            `\nDownloading repository history from S3 bucket "${bucketName}"...`
-        );
+        repositoryId = sanitizeRepoId(repositoryId);
+    } catch (err) {
+        console.error(`Error: ${err.message}`);
+        return;
+    }
 
-        // Create commits directory if it doesn't exist
+    const s3Prefix = `repositories/${repositoryId}/`;
+    const commitsPrefix = `repositories/${repositoryId}/commits/`;
+    const headKey = `repositories/${repositoryId}/repo-state/head.json`;
+
+    try {
+        console.log(`\nDownloading repository "${repositoryId}" from S3 bucket "${bucketName}"...`);
         await fs.mkdir(commitsPath, { recursive: true });
 
-        // List all objects inside commits/
-        const listCommand = new ListObjectsV2Command({
-            Bucket: bucketName,
-            Prefix: "commits/",
-        });
+        // Step 1: Paginated listing of all objects under repositories/<repoId>/commits/
+        let continuationToken = undefined;
+        let allObjects = [];
+        do {
+            const listCommand = new ListObjectsV2Command({
+                Bucket: bucketName,
+                Prefix: commitsPrefix,
+                ContinuationToken: continuationToken,
+            });
 
-        const response = await s3Client.send(listCommand);
+            const listResponse = await s3Client.send(listCommand);
+            const contents = listResponse.Contents || [];
+            allObjects = allObjects.concat(contents);
 
-        const objects = response.Contents || [];
+            if (listResponse.IsTruncated && listResponse.NextContinuationToken) {
+                continuationToken = listResponse.NextContinuationToken;
+            } else {
+                continuationToken = undefined;
+            }
+        } while (continuationToken);
 
-        if (objects.length === 0) {
+        if (allObjects.length === 0) {
             console.log("No commits found in the remote repository.");
         } else {
             let downloadedFiles = 0;
 
-            // Download every commit file
-            for (const object of objects) {
+            for (const object of allObjects) {
                 const s3Key = object.Key;
+                if (!s3Key || s3Key.endsWith("/")) continue;
 
-                // Ignore empty folder keys
-                if (!s3Key || s3Key.endsWith("/")) {
-                    continue;
-                }
+                // Strip prefix
+                const relativeToCommits = s3Key.slice(commitsPrefix.length);
+                const localFilePath = path.join(commitsPath, relativeToCommits);
 
-                console.log(`Downloading: ${s3Key}`);
+                await fs.mkdir(path.dirname(localFilePath), { recursive: true });
 
                 const getCommand = new GetObjectCommand({
                     Bucket: bucketName,
                     Key: s3Key,
                 });
-
                 const fileResponse = await s3Client.send(getCommand);
 
-                // Remove "commits/" from the beginning
-                const relativePath = s3Key.replace(/^commits\//, "");
+                // Check for symlink metadata
+                const isSymlink = fileResponse.Metadata?.["x-apnagit-symlink"] === "true";
+                const symlinkTarget = fileResponse.Metadata?.["x-target"];
 
-                // Local file path
-                const localFilePath = path.join(
-                    commitsPath,
-                    relativePath
-                );
-
-                // Create required directories
-                await fs.mkdir(path.dirname(localFilePath), {
-                    recursive: true,
-                });
-
-                // Convert S3 response body to Buffer
-                const fileContent = await fileResponse.Body.transformToByteArray();
-
-                // Write file locally
-                await fs.writeFile(
-                    localFilePath,
-                    Buffer.from(fileContent)
-                );
+                if (isSymlink && symlinkTarget) {
+                    try { await fs.unlink(localFilePath); } catch {}
+                    await fs.symlink(symlinkTarget, localFilePath);
+                } else {
+                    const fileContent = await fileResponse.Body.transformToByteArray();
+                    await fs.writeFile(localFilePath, Buffer.from(fileContent));
+                }
 
                 downloadedFiles++;
-
-                console.log(`Downloaded successfully: ${relativePath}`);
+                console.log(`Downloaded: ${relativeToCommits}`);
             }
 
-            console.log(
-                `\nTotal commit files downloaded: ${downloadedFiles}`
-            );
+            console.log(`\nTotal commit objects downloaded: ${downloadedFiles}`);
         }
 
-        // Download head.json
+        // Step 2: Download remote HEAD
         try {
-            console.log("\nDownloading repository metadata...");
-
+            console.log("Downloading repository metadata...");
             const headCommand = new GetObjectCommand({
                 Bucket: bucketName,
-                Key: "repo-state/head.json",
+                Key: headKey,
             });
 
             const headResponse = await s3Client.send(headCommand);
+            const headContent = await headResponse.Body.transformToString();
+            const parsedRemoteHead = JSON.parse(headContent);
 
-            const headContent =
-                await headResponse.Body.transformToString();
-
-            await fs.writeFile(
-                path.join(repoPath, "head.json"),
-                headContent
-            );
-
-            console.log("head.json downloaded successfully.");
+            if (parsedRemoteHead.currentCommit) {
+                // Validate that the referenced commit exists locally
+                const commitDir = path.join(commitsPath, parsedRemoteHead.currentCommit);
+                try {
+                    await fs.access(commitDir);
+                    await fs.writeFile(headPath, JSON.stringify({ currentCommit: parsedRemoteHead.currentCommit }, null, 2));
+                    console.log(`head.json updated to remote commit: ${parsedRemoteHead.currentCommit}`);
+                } catch {
+                    console.warn(`Warning: Remote HEAD points to "${parsedRemoteHead.currentCommit}", but commit folder was not found locally. Local HEAD was not updated.`);
+                }
+            }
         } catch (error) {
-            if (error.name === "NoSuchKey") {
-                console.log(
-                    "No remote head.json found. Skipping metadata download."
-                );
+            if (error.name === "NoSuchKey" || error.$metadata?.httpStatusCode === 404) {
+                console.log("No remote head.json found. Skipping metadata download.");
             } else {
                 throw error;
             }
@@ -158,37 +165,12 @@ async function PullFile() {
 
         console.log("\n----------------------------------------");
         console.log("Repository successfully pulled from S3!");
+        console.log(`Repository ID: ${repositoryId}`);
         console.log(`S3 Bucket: ${bucketName}`);
         console.log("----------------------------------------");
-
     } catch (error) {
         console.error("\nFailed to pull repository from S3.");
         console.error("Error:", error.message);
-
-        // AWS credentials error
-        if (
-            error.name === "CredentialsProviderError" ||
-            error.name === "CredentialProviderError"
-        ) {
-            console.error(
-                "\nAWS credentials were not found. Configure them using:"
-            );
-            console.error("aws configure");
-        }
-
-        // Bucket doesn't exist
-        if (error.name === "NoSuchBucket") {
-            console.error(
-                `\nThe S3 bucket "${bucketName}" does not exist.`
-            );
-        }
-
-        // Access denied
-        if (error.name === "AccessDenied") {
-            console.error(
-                "\nAccess denied. Check your AWS IAM permissions."
-            );
-        }
     }
 }
 

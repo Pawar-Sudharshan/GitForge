@@ -1,8 +1,11 @@
 import fs from "fs/promises";
 import path from "path";
+import { buildDirectoryManifest, copyDirectoryRecursive } from '../utils/snapshotEngine.js';
+import { validatePathSafety } from '../utils/pathSecurity.js';
 
 async function RevertFile(argv) {
     const commitId = argv.commitId || (argv._ && argv._[1]);
+    const force = Boolean(argv.force || argv.f);
 
     if (!commitId) {
         console.error(
@@ -14,23 +17,14 @@ async function RevertFile(argv) {
     const repoPath = path.resolve(process.cwd(), ".apnaGit");
     const commitsPath = path.join(repoPath, "commits");
     const targetCommitPath = path.join(commitsPath, commitId);
+    const headPath = path.join(repoPath, "head.json");
     const workspacePath = process.cwd();
 
     // Check repository
     try {
         await fs.access(repoPath);
     } catch {
-        console.error(
-            'Repository not initialized. Run "node index.js init" first.'
-        );
-        return;
-    }
-
-    // Check commits directory
-    try {
-        await fs.access(commitsPath);
-    } catch {
-        console.error("Commits directory not found.");
+        console.error('Repository not initialized. Run "node index.js init" first.');
         return;
     }
 
@@ -45,89 +39,95 @@ async function RevertFile(argv) {
     try {
         console.log(`Reverting workspace to commit: ${commitId}...`);
 
-        /**
-         * Recursively copy files from the commit directory
-         * to the workspace.
-         */
-        async function restoreDirectory(sourceDir, destinationDir) {
-            const entries = await fs.readdir(sourceDir, {
-                withFileTypes: true,
-            });
+        // Read target commit metadata
+        let targetMeta = {};
+        try {
+            const data = await fs.readFile(path.join(targetCommitPath, "commit-metadata.json"), "utf-8");
+            targetMeta = JSON.parse(data);
+        } catch {
+            console.error(`Could not read metadata for commit "${commitId}".`);
+            return;
+        }
 
-            for (const entry of entries) {
-                // Skip commit metadata
-                if (entry.name === "commit-metadata.json") {
-                    continue;
-                }
+        const isLegacy = !(targetMeta.version === 2);
+        if (isLegacy) {
+            console.warn(`[Notice] Commit "${commitId}" was created using legacy format (v1). Only partial files will be restored.`);
+        }
 
-                const sourcePath = path.join(sourceDir, entry.name);
-                const destinationPath = path.join(
-                    destinationDir,
-                    entry.name
-                );
+        // Read current HEAD metadata to identify tracked files
+        let currentHeadId = null;
+        try {
+            const headRaw = await fs.readFile(headPath, "utf-8");
+            currentHeadId = JSON.parse(headRaw).currentCommit;
+        } catch {}
 
-                if (entry.isDirectory()) {
-                    // Create destination directory
-                    await fs.mkdir(destinationPath, {
-                        recursive: true,
-                    });
+        let currentTrackedFiles = [];
+        if (currentHeadId) {
+            try {
+                const curMetaRaw = await fs.readFile(path.join(commitsPath, currentHeadId, "commit-metadata.json"), "utf-8");
+                const curMeta = JSON.parse(curMetaRaw);
+                currentTrackedFiles = curMeta.files || [];
+            } catch {}
+        }
 
-                    // Recursively restore files
-                    await restoreDirectory(
-                        sourcePath,
-                        destinationPath
-                    );
-                } else if (entry.isFile()) {
-                    // Make sure parent directory exists
-                    await fs.mkdir(
-                        path.dirname(destinationPath),
-                        {
-                            recursive: true,
-                        }
-                    );
+        // Build target manifest
+        const targetManifest = await buildDirectoryManifest(targetCommitPath);
+        const targetFileSet = new Set(targetManifest.map(m => m.path));
 
-                    await fs.copyFile(
-                        sourcePath,
-                        destinationPath
-                    );
+        // Protection check: verify no uncommitted local modifications to tracked files (unless --force)
+        if (!force && currentHeadId && currentHeadId !== commitId) {
+            for (const file of currentTrackedFiles) {
+                const diskPath = path.resolve(workspacePath, file);
+                try {
+                    const currentInHead = path.join(commitsPath, currentHeadId, file);
+                    const [diskContent, headContent] = await Promise.all([
+                        fs.readFile(diskPath),
+                        fs.readFile(currentInHead)
+                    ]);
+                    if (!diskContent.equals(headContent)) {
+                        console.error(`[Revert Aborted] Uncommitted local modifications detected in "${file}". Use --force to discard.`);
+                        return;
+                    }
+                } catch {}
+            }
+        }
 
-                    console.log(
-                        `Restored: ${path.relative(
-                            workspacePath,
-                            destinationPath
-                        )}`
-                    );
+        // Step 1: Restore all files from target snapshot into workspace
+        for (const item of targetManifest) {
+            const relPath = validatePathSafety(item.path, workspacePath);
+            const srcPath = path.join(targetCommitPath, relPath);
+            const destPath = path.join(workspacePath, relPath);
+
+            await fs.mkdir(path.dirname(destPath), { recursive: true });
+
+            if (item.isSymlink) {
+                try { await fs.unlink(destPath); } catch {}
+                await fs.symlink(item.target, destPath);
+            } else {
+                await fs.copyFile(srcPath, destPath);
+            }
+            console.log(`Restored: ${relPath}`);
+        }
+
+        // Step 2: Safe pruning — ONLY remove files that were tracked in currentHead but absent in target
+        // Untracked workspace files are NEVER deleted!
+        if (!isLegacy && currentTrackedFiles.length > 0) {
+            for (const oldFile of currentTrackedFiles) {
+                if (!targetFileSet.has(oldFile)) {
+                    const toDelete = path.resolve(workspacePath, oldFile);
+                    try {
+                        await fs.unlink(toDelete);
+                        console.log(`Removed (not in target snapshot): ${oldFile}`);
+                    } catch {}
                 }
             }
         }
 
-        // Restore commit files
-        await restoreDirectory(
-            targetCommitPath,
-            workspacePath
-        );
-
-        // Update head.json
-        const headPath = path.join(repoPath, "head.json");
-
-        const headData = {
-            currentCommit: commitId,
-        };
-
-        await fs.writeFile(
-            headPath,
-            JSON.stringify(headData, null, 2),
-            "utf-8"
-        );
-
-        console.log(
-            `\nWorkspace successfully reverted to commit: ${commitId}`
-        );
+        // Step 3: Update head.json
+        await fs.writeFile(headPath, JSON.stringify({ currentCommit: commitId }, null, 2), "utf-8");
+        console.log(`\nWorkspace successfully reverted to commit: ${commitId}`);
     } catch (error) {
-        console.error(
-            `Error reverting workspace to commit "${commitId}":`,
-            error.message
-        );
+        console.error(`Error reverting workspace to commit "${commitId}":`, error.message);
     }
 }
 
